@@ -170,71 +170,101 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
-    // -------------------------
-    // /end
-    // -------------------------
-    if (interaction.isChatInputCommand() && interaction.commandName === 'end') {
-      const session = sessions.get(interaction.guildId);
-      if (!session) {
-        return interaction.reply({ content: 'Ingen aktiv session. Kjør /game først.', ephemeral: true });
-      }
-
-      await ensurePerms(interaction);
-      await interaction.deferReply({ ephemeral: true });
-
-      const guild = interaction.guild;
-      const backId = session.originalChannelId;
-
-      // Flytt alle tilbake og slett midlertidige kanaler
-      const moveBack = async (chanId) => {
-        const chan = guild.channels.cache.get(chanId);
-        if (!chan || chan.type !== ChannelType.GuildVoice) return;
-        for (const [, m] of chan.members) {
-          await m.voice.setChannel(backId).catch(() => {});
-        }
-        await chan.delete('End game').catch(() => {});
-      };
-
-      await moveBack(session.chanA);
-      await moveBack(session.chanB);
-
-      // Oppdater lag-meldingen: fjern knapper + sett footer til "Game ended"
-      try {
-        const ch = await guild.channels.fetch(session.teamsChannelId).catch(() => null);
-        if (ch && ch.isTextBased()) {
-          const msg = await ch.messages.fetch(session.teamsMessageId).catch(() => null);
-          if (msg) {
-            const old = msg.embeds?.[0];
-            const newEmbed = old ? EmbedBuilder.from(old).setFooter({ text: 'Game ended' }) : null;
-            await msg.edit({
-              embeds: newEmbed ? [newEmbed] : msg.embeds,
-              components: [], // fjern knapper
-            }).catch(() => {});
-          }
-        }
-      } catch (e) {
-        console.warn('Kunne ikke oppdatere teams-meldingen:', e?.message);
-      }
-
-      sessions.delete(interaction.guildId);
-      await interaction.editReply('🧹 Game ended — everyone moved back!');
-      return;
-    }
-  } catch (err) {
-    console.error('Interaction error:', err);
-    // Gi brukeren en beskjed uten å spamme kanalen
-    try {
-      if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: 'Noe gikk galt 😅 Prøv igjen.', ephemeral: true });
-      } else if (interaction.deferred && !interaction.replied) {
-        await interaction.editReply('Noe gikk galt 😅 Prøv igjen.');
-      }
-    } catch {}
-    if (err.message === 'MISSING_PERMS') {
-      console.error('Mangler nødvendige rettigheter: ManageChannels, MoveMembers, ViewChannel, Connect.');
-    }
+  // -------------------------
+// /end
+// -------------------------
+if (interaction.isChatInputCommand() && interaction.commandName === 'end') {
+  const session = sessions.get(interaction.guildId);
+  if (!session) {
+    return interaction.reply({ content: 'Ingen aktiv session. Kjør /game først.', ephemeral: true });
   }
-});
+
+  await interaction.deferReply({ ephemeral: true });
+  const guild = interaction.guild;
+
+  // 1) Finn originalkanalen (eller lag en "Lobby")
+  let backChan = await guild.channels.fetch(session.originalChannelId).catch(() => null);
+  const parent = backChan?.parentId ?? null;
+
+  if (!backChan || backChan.type !== ChannelType.GuildVoice) {
+    // originalen finnes ikke – lag en ny lobby
+    backChan = await guild.channels.create({
+      name: 'Lobby',
+      type: ChannelType.GuildVoice,
+      parent,
+      reason: 'Original voice channel missing – creating Lobby',
+    }).catch(() => null);
+  }
+  if (!backChan) {
+    await interaction.editReply('Kunne ikke finne eller lage en kanal å flytte folk til (mangler rettigheter?).');
+    return;
+  }
+
+  // 2) Sjekk nødvendige rettigheter i backChan
+  const me = await guild.members.fetchMe();
+  const perms = me.permissionsIn(backChan);
+  const need = ['ViewChannel','Connect','MoveMembers'];
+  const ok = need.every(p => perms.has(PermissionFlagsBits[p]));
+  if (!ok) {
+    await interaction.editReply('Mangler rettigheter i målekanalen (trenger ViewChannel, Connect, MoveMembers).');
+    return;
+  }
+
+  // 3) Flytt folk fra en team-kanal, slett bare hvis den er tom etterpå
+  const moveOut = async (chanId) => {
+    const chan = guild.channels.cache.get(chanId);
+    if (!chan || chan.type !== ChannelType.GuildVoice) return { moved: 0, left: 0 };
+    let moved = 0;
+
+    // kopier først – members-mappen endrer seg mens vi flytter
+    const members = [...chan.members.values()];
+    for (const m of members) {
+      try {
+        await m.voice.setChannel(backChan);
+        moved++;
+      } catch {
+        // ikke slett kanal hvis noen står igjen
+      }
+    }
+
+    // oppdater cache og slett bare hvis tom
+    await chan.fetch(true).catch(() => {});
+    const left = chan.members.size;
+    if (left === 0) {
+      await chan.delete('End game').catch(() => {});
+    }
+    return { moved, left };
+  };
+
+  const rA = await moveOut(session.chanA);
+  const rB = await moveOut(session.chanB);
+
+  // 4) Oppdater lag-meldingen (fjern knapper + marker avsluttet)
+  try {
+    const ch = await guild.channels.fetch(session.teamsChannelId).catch(() => null);
+    if (ch && ch.isTextBased()) {
+      const msg = await ch.messages.fetch(session.teamsMessageId).catch(() => null);
+      if (msg) {
+        const old = msg.embeds?.[0];
+        const newEmbed = old ? EmbedBuilder.from(old).setFooter({ text: 'Game ended' }) : null;
+        await msg.edit({
+          embeds: newEmbed ? [newEmbed] : msg.embeds,
+          components: [], // fjern knappene
+        }).catch(() => {});
+      }
+    }
+  } catch {}
+
+  sessions.delete(interaction.guildId);
+
+  // 5) Gi tydelig status, men kun til den som kjørte /end
+  const info = `🧹 Game ended — everyone moved back!\n` +
+               `Team A: flyttet ${rA.moved}, igjen ${rA.left}\n` +
+               `Team B: flyttet ${rB.moved}, igjen ${rB.left}`;
+  await interaction.editReply(info);
+  return;
+}
+
 
 // Ekstra: ikke la uventede feil drepe prosessen i stillhet
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
